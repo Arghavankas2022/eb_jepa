@@ -1,0 +1,30 @@
+meta:
+  device: cuda
+  seed: 42
+  output_dir: output/cell_jepa
+
+data:
+  h5ad_path: /mlbio_scratch/kassraie/World_Model_Cell_Fate/toy_jepa_subset4/toy_subset4.h5ad
+  pairs_path: /mlbio_scratch/kassraie/World_Model_Cell_Fate/toy_jepa_subset4/toy_pairs.npy
+  batch_size: 256
+  num_workers: 4
+
+model:
+  hidden_dim: 512
+  embed_dim: 128
+  pred_hidden_dim: 256
+  proj_hidden_dim: 2048
+  proj_output_dim: 2048
+
+optim:
+  lr: 0.001
+  weight_decay: 0.00001
+  epochs: 20
+
+loss:
+  std_coeff: 1.0
+  cov_coeff: 80.0
+  vicreg_lambda: 1.0
+
+logging:
+  log_wandb: false

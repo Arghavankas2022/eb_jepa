@@ -1,0 +1,32 @@
+meta:
+  device: cuda
+  seed: 42
+  output_dir: output/cell_jepa_balanced_25_25
+
+data:
+  h5ad_path: /mlbio_scratch/kassraie/World_Model_Cell_Fate/Data_pairs/Pairs/Subset_4/subset4_forward.h5ad
+  pairs_path: /mlbio_scratch/kassraie/World_Model_Cell_Fate/Data_pairs/Pairs/Subset_4/pairs_forward_local.npy
+  batch_size: 128
+  num_workers: 4
+
+model:
+  hidden_dim: 1024
+  embed_dim: 256
+  pred_hidden_dim: 512
+  proj_hidden_dim: 4096 #maybe drop this to 1024
+  proj_output_dim: 4096
+
+optim:
+  lr: 0.0005
+  weight_decay: 0.00001
+  epochs: 10
+
+loss:
+  std_coeff: 0.01
+  cov_coeff: 0.1
+  vicreg_lambda: 1.0
+
+logging:
+  log_wandb: true
+  log_every: 1
+  save_every: 5
