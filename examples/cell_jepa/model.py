@@ -1,3 +1,13 @@
+## CellEncoder and CellPredictor for the Cell-JEPA model.
+##
+## Architecture overview:
+##   CellEncoder:  gene expression [n_genes] → latent embedding [embed_dim=256]
+##                 3-layer MLP with BatchNorm + ReLU hidden layers
+##
+##   CellPredictor: latent embedding at time t → predicted embedding at time t+1
+##                  3-layer MLP with BatchNorm + ReLU hidden layers
+##                  No action input (cell fate is determined by internal state only)
+
 import torch
 import torch.nn as nn
 
@@ -31,8 +41,8 @@ class CellEncoder(nn.Module):
         # x: [B, C, T, H, W] or [B, C]
         if x.dim() == 5:
             B, C, T, H, W = x.shape
-            # Flatten spatial into channels if any, then permute T
-            # [B, C, T, H, W] -> [B, T, C, H, W] -> [B*T, C*H*W]
+            # Flatten spatial dims and process each time-step independently
+            # [B, C, T, 1, 1] → [B, T, C] → [B*T, C] → MLP → [B*T, D]
             x_flat = x.permute(0, 2, 1, 3, 4).reshape(B * T, -1)
             z = self.backbone(x_flat)
             # Reshape back to [B, D, T, 1, 1]

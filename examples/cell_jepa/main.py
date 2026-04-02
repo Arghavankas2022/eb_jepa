@@ -7,7 +7,7 @@ import wandb
 from eb_jepa.logging import get_logger
 from eb_jepa.jepa import JEPA
 from eb_jepa.architectures import Projector
-from eb_jepa.losses import SquareLossSeq, VCLoss
+from eb_jepa.losses import SquareLossSeq, VCLoss  # Cosine: from eb_jepa.losses import CosineLossSeq, VCLoss
 from eb_jepa.training_utils import (
     setup_device,
     setup_seed,
@@ -26,9 +26,6 @@ from examples.cell_jepa.model import CellEncoder, CellPredictor
 logger = get_logger(__name__)
 
 os.environ["WANDB_API_KEY"] = "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"
-
-#TODO: add cell type classification as a downstream task, and evaluate the model on accuracy of this 
-# use k-neigherest neighbour and use some voting to pick the nearest cell types, (?even if one of them is correct, still a win)
 
  
 def main(fname="examples/cell_jepa/cfgs/default.yaml", **overrides):
@@ -50,6 +47,47 @@ def main(fname="examples/cell_jepa/cfgs/default.yaml", **overrides):
 
     # Data
     full_dataset = CellDataset(cfg.data.h5ad_path, cfg.data.pairs_path)
+
+    # Build valid-transition set from the expert-curated metadata Excel file.
+    # Uses ONLY "Developmental progression" edges — same filter as data_pairing.py.
+    from collections import defaultdict
+    from examples.cell_jepa.data_pairing_utils import parse_developmental_edges
+    valid_transitions = defaultdict(set)
+    excel_path = cfg.data.get("metadata_excel_path",
+                              "/mlbio_scratch/wen2/cellfate_FM/mouse_developmental/metedata.xlsx")
+    if full_dataset.cell_type_labels is not None and os.path.exists(excel_path):
+        try:
+            edges_df = parse_developmental_edges(excel_path)
+            name_to_idx = full_dataset.cell_type_to_idx  # cell type name → int index
+            for _, row in edges_df.iterrows():
+                cx, cy = row["Cell state name (x)"], row["Cell state name (y)"]
+                if cx in name_to_idx and cy in name_to_idx:
+                    valid_transitions[name_to_idx[cx]].add(name_to_idx[cy])
+            n_src = len(valid_transitions)
+            n_edges = sum(len(v) for v in valid_transitions.values())
+            logger.info(f"Valid transitions (Excel, dev. progression only): {n_src} source types, {n_edges} edges")
+        except Exception as e:
+            logger.warning(f"Could not load Excel transitions ({e}); falling back to observed pairs.")
+            for i_curr, i_next in full_dataset.pairs:
+                valid_transitions[full_dataset.cell_type_labels[i_curr]].add(
+                    full_dataset.cell_type_labels[i_next])
+    else:
+        logger.warning("No Excel path found; valid_transitions will be empty.")
+
+    # Save valid_transitions as a readable CSV (one row per source → target edge)
+    if valid_transitions and full_dataset.cell_type_to_idx:
+        import pandas as pd
+        idx_to_name = {v: k for k, v in full_dataset.cell_type_to_idx.items()}
+        rows = [
+            {"source_cell_type": idx_to_name.get(src, str(src)),
+             "target_cell_type": idx_to_name.get(tgt, str(tgt))}
+            for src, targets in sorted(valid_transitions.items())
+            for tgt in sorted(targets)
+        ]
+        vt_csv_path = os.path.join(cfg.meta.output_dir, "valid_transitions.csv")
+        os.makedirs(cfg.meta.output_dir, exist_ok=True)
+        pd.DataFrame(rows).to_csv(vt_csv_path, index=False)
+        logger.info(f"Saved valid transitions to {vt_csv_path}")
     
     # Reproducible 80/20 Split
     train_size = int(0.8 * len(full_dataset))
@@ -93,7 +131,8 @@ def main(fname="examples/cell_jepa/cfgs/default.yaml", **overrides):
         proj=projector
     )
 
-    ploss_fn = SquareLossSeq(proj=projector)
+    ploss_fn = SquareLossSeq(proj=None)  # MSE in raw 256D latent space
+    # ploss_fn = CosineLossSeq(proj=None)  # Cosine: cosine distance in raw 256D latent space
     jepa = JEPA(
         encoder=encoder,
         aencoder=nn.Identity(),
@@ -103,25 +142,38 @@ def main(fname="examples/cell_jepa/cfgs/default.yaml", **overrides):
     ).to(device)
     
     optimizer = torch.optim.AdamW(jepa.parameters(), lr=cfg.optim.lr, weight_decay=cfg.optim.weight_decay)
-    
+    use_cosine = cfg.optim.get("use_cosine", True)
+    if use_cosine:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=cfg.optim.epochs, eta_min=cfg.optim.lr * 0.01
+        )
+        logger.info(f"Using cosine LR schedule: {cfg.optim.lr:.2e} → {cfg.optim.lr*0.01:.2e}")
+    else:
+        scheduler = None
+        logger.info(f"Using constant LR: {cfg.optim.lr:.2e}")
+
     # Training loop
     global_step = 0
     for epoch in range(cfg.optim.epochs):
         jepa.train()
         train_losses = []
+        pred_coeff = cfg.loss.get("pred_coeff", 1.0)
         pbar = tqdm(train_loader, desc=f"Epoch {epoch} [Train]")
-        
         for batch in pbar:
             x_curr, x_next = batch[0].to(device), batch[1].to(device)
             x_traj = torch.cat([x_curr, x_next], dim=2)
             
-            _, (loss, rloss, _, _, ploss) = jepa.unroll(
+            _, (_, rloss, _, _, ploss) = jepa.unroll(
                 observations=x_traj,
                 actions=None,
                 nsteps=1,
                 unroll_mode="autoregressive",
-                compute_loss=True
+                compute_loss=True,
+                stop_grad_target=True,  # detach target — prevents predictor identity collapse
+                # stop_grad_target=False,  # OLD: no stop-gradient (target stays in graph)
             )
+            
+            loss = rloss + pred_coeff * ploss
             
             optimizer.zero_grad()
             loss.backward()
@@ -133,13 +185,14 @@ def main(fname="examples/cell_jepa/cfgs/default.yaml", **overrides):
             optimizer.step()
             
             train_losses.append(loss.item())
-            pbar.set_postfix({"loss": f"{loss.item():.4f}", "pred": f"{ploss.item():.4f}"})
+            pbar.set_postfix({"loss": f"{loss.item():.4f}", "vicreg": f"{rloss.item():.4f}", "pred": f"{ploss.item():.4f}"})
+            # pbar.set_postfix({"loss": f"{loss.item():.4f}", "vicreg": f"{rloss.item():.4f}", "cos": f"{ploss.item():.4f}"})  # Cosine
             
             if _log_wandb and global_step % 20 == 0:
                 wandb.log({
                     "train/step_total_loss": loss.item(),
                     "train/step_vicreg_loss": rloss.item(),
-                    "train/step_prediction_loss": ploss.item(),
+                    "train/step_prediction_loss": ploss.item(),  # Cosine: "train/step_cosine_loss": ploss.item()
                     "train/grad_norm_l1": grad_l1,
                     "train/grad_norm_l2": grad_l2,
                     "epoch": epoch
@@ -147,20 +200,20 @@ def main(fname="examples/cell_jepa/cfgs/default.yaml", **overrides):
             
             global_step += 1
 
+
         # Validation at end of epoch
         jepa.eval()
         test_losses = []
         mse_latent_scores = []
         cos_sim_scores = []
         y_targets = []
-        y_currs = []         # for identity baseline
+        y_currs = []         # y_curr labels for valid-transition metric
         z_targets_list = []
         z_preds_list = []
-        z_currs_list = []    # for static encoder baseline
         with torch.no_grad():
             for batch in tqdm(test_loader, desc=f"Epoch {epoch} [Test]"):
                 x_curr, x_next = batch[0].to(device), batch[1].to(device)
-                y_next = batch[2] if len(batch) > 2 else None
+                y_next = batch[3] if len(batch) > 3 else None  # batch: x_curr, x_next, y_curr, y_next
                 x_traj = torch.cat([x_curr, x_next], dim=2)
                 
                 state, (loss, _, _, _, _) = jepa.unroll(
@@ -186,10 +239,7 @@ def main(fname="examples/cell_jepa/cfgs/default.yaml", **overrides):
                     y_targets.extend(y_next.numpy().tolist())
                     z_targets_list.append(z_next_target.cpu().numpy())
                     z_preds_list.append(z_next_pred.cpu().numpy())
-                    # Baselines
-                    z_curr_enc = jepa.encoder(x_curr).flatten(1)
-                    z_currs_list.append(z_curr_enc.cpu().numpy())
-                    y_currs.extend(batch[2].numpy().tolist())  # y_curr = label of x_curr
+                    y_currs.extend(batch[2].numpy().tolist())  # y_curr labels needed for valid-transition metric
 
         avg_train_loss = np.mean(train_losses)
         avg_test_loss = np.mean(test_losses)
@@ -197,34 +247,39 @@ def main(fname="examples/cell_jepa/cfgs/default.yaml", **overrides):
         avg_cos_sim = np.mean(cos_sim_scores) if cos_sim_scores else 0.0
         
         knn_acc = None
-        knn_static_acc = None
-        knn_identity_acc = None
         if epoch % 2 == 0 and len(y_targets) > 0 and len(set(y_targets)) > 1:
             from sklearn.neighbors import KNeighborsClassifier
-            Z_bank   = np.concatenate(z_targets_list, axis=0)
-            Z_query  = np.concatenate(z_preds_list,   axis=0)
-            Z_curr   = np.concatenate(z_currs_list,   axis=0)
-            Y_next   = np.array(y_targets)
-            Y_curr   = np.array(y_currs)
+            Z_bank  = np.concatenate(z_targets_list, axis=0)
+            Z_query = np.concatenate(z_preds_list,   axis=0)
+            Y_next  = np.array(y_targets)
+            Y_curr  = np.array(y_currs)
             
-            knn = KNeighborsClassifier(n_neighbors=5)
+            knn = KNeighborsClassifier(n_neighbors=5)  # Euclidean: consistent with MSE training
+            # knn = KNeighborsClassifier(n_neighbors=5, metric="cosine")  # Cosine: use with cosine loss
             
             # Predictor KNN: predict cell type of z_next using predicted embedding
             knn.fit(Z_bank, Y_next)
-            knn_acc = np.mean(knn.predict(Z_query) == Y_next)
-            
-            # Static encoder baseline: use z_curr (no predictor) to predict y_next
-            knn.fit(Z_bank, Y_next)
-            knn_static_acc = np.mean(knn.predict(Z_curr) == Y_next)
-            
-            # Identity baseline: use z_curr to predict y_curr (same-state discrimination)
-            knn.fit(Z_curr, Y_curr)
-            knn_identity_acc = np.mean(knn.predict(Z_curr) == Y_curr)
-            
+            _, nb_idx = knn.kneighbors(Z_query)
+            nb_labels = Y_next[nb_idx]
+            knn_acc      = np.mean(knn.predict(Z_query) == Y_next)
+            knn_any5_acc = np.mean(np.any(nb_labels == Y_next[:, None], axis=1))
+
+            # Valid-transition metric: count prediction as correct if predicted label
+            # is ANY valid next type for the source cell type (not just the specific pair target).
+            if valid_transitions:
+                pred_labels = knn.predict(Z_query)
+                knn_valid_acc = np.mean([
+                    pred_labels[i] in valid_transitions[Y_curr[i]]
+                    for i in range(len(pred_labels))
+                ])
+            else:
+                knn_valid_acc = None
+
             logger.info(
-                f"Epoch {epoch}: Train Loss: {avg_train_loss:.4f}, Test Loss: {avg_test_loss:.4f}, "
-                f"Latent MSE: {avg_mse_latent:.4f}, Cosine: {avg_cos_sim:.4f} | "
-                f"KNN predictor={knn_acc:.4f} static_enc={knn_static_acc:.4f} identity={knn_identity_acc:.4f}"
+                f"Epoch {epoch}: Train={avg_train_loss:.4f} Test={avg_test_loss:.4f} "
+                f"MSE={avg_mse_latent:.4f} Cos={avg_cos_sim:.4f} | "
+                f"KNN: pred={knn_acc:.3f}/{knn_any5_acc:.3f} "
+                f"valid-transition={knn_valid_acc:.3f}"
             )
         else:
             logger.info(f"Epoch {epoch}: Train Loss: {avg_train_loss:.4f}, Test Loss: {avg_test_loss:.4f}, Latent MSE: {avg_mse_latent:.4f}, Latent Cosine Sim: {avg_cos_sim:.4f}")
@@ -237,12 +292,21 @@ def main(fname="examples/cell_jepa/cfgs/default.yaml", **overrides):
             "epoch": epoch
         }
         if knn_acc is not None:
-            metrics["test/knn_predictor_acc"]  = knn_acc
-            metrics["test/knn_static_enc_acc"] = knn_static_acc
-            metrics["test/knn_identity_acc"]   = knn_identity_acc
+            metrics["test/knn_predictor_acc"]       = knn_acc
+            metrics["test/knn_predictor_any5_acc"]  = knn_any5_acc
+            if knn_valid_acc is not None:
+                metrics["test/knn_predictor_valid_acc"] = knn_valid_acc
         log_epoch(epoch, metrics)
         if _log_wandb:
             wandb.log(metrics, step=global_step)
+        if scheduler is not None:
+            scheduler.step()
+            current_lr = scheduler.get_last_lr()[0]
+        else:
+            current_lr = cfg.optim.lr
+        logger.info(f"  LR after epoch {epoch}: {current_lr:.2e}")
+        if _log_wandb:
+            wandb.log({"train/lr": current_lr}, step=global_step)
 
     # Save
     ckpt_path = os.path.join(cfg.meta.output_dir, "cell_jepa.pt")

@@ -20,11 +20,13 @@ optim:
   lr: 0.001
   weight_decay: 0.00001
   epochs: 20
+  use_cosine: true
 
 loss:
   std_coeff: 1.0
   cov_coeff: 80.0
   vicreg_lambda: 1.0
+  pred_coeff: 1.0
 
 logging:
   log_wandb: false

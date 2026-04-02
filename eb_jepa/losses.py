@@ -26,6 +26,25 @@ class SquareLossSeq(nn.Module):
         return square_cost_seq(state, predi)
 
 
+class CosineLossSeq(nn.Module):
+    """Cosine distance loss over a sequence (feature dim at dim 1).
+
+    Loss = mean(1 - cosine_similarity(z_target, z_pred)) across the batch.
+    This is scale-invariant and penalises directional mismatch in the latent
+    space.  An optional projection layer can be applied before computing
+    similarity.
+    """
+
+    def __init__(self, proj=None):
+        super().__init__()
+        self.proj = nn.Identity() if proj is None else proj
+
+    def forward(self, state, predi):
+        state = self.proj(state.transpose(0, 1).flatten(1).transpose(0, 1))
+        predi = self.proj(predi.transpose(0, 1).flatten(1).transpose(0, 1))
+        return (1.0 - F.cosine_similarity(state, predi, dim=1)).mean()
+
+
 class VCLoss(nn.Module):
     """Variance-Covariance loss attracting means to zero and covariance to identity."""
 

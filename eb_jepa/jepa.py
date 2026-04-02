@@ -65,6 +65,7 @@ class JEPA(JEPAbase):
         ctxt_window_time=1,
         compute_loss=True,
         return_all_steps=False,
+        stop_grad_target=False,
     ):
         """Unified multi-step prediction with optional loss computation.
 
@@ -109,6 +110,11 @@ class JEPA(JEPAbase):
             compute_loss: Whether to compute losses (requires ground truth observations)
             return_all_steps: If True, return list of predictions at each step (like infern).
                 If False, return only the final predicted states.
+            stop_grad_target: If True, detach the target encoding before computing
+                prediction loss. This prevents trivial identity solutions where the
+                predictor collapses to predict whatever the encoder already outputs.
+                Equivalent to a stop-gradient on the target branch (as in SimSiam/BYOL).
+                Defaults to False to preserve backward compatibility.
 
         Returns:
             Tuple of (predicted_states, losses) where:
@@ -154,7 +160,8 @@ class JEPA(JEPAbase):
                     (state[:, :, :context_length], predicted_states), dim=2
                 )
                 if compute_loss:
-                    ploss += self.predcost(state, predicted_states) / nsteps
+                    target = state.detach() if stop_grad_target else state
+                    ploss += self.predcost(target, predicted_states) / nsteps
 
         # Autoregressive mode: step-by-step with sliding window
         # Note: RNN predictors (is_rnn=True) are a special case with ctxt_window_time=1
@@ -185,9 +192,10 @@ class JEPA(JEPAbase):
                 if return_all_steps:
                     all_steps.append(predicted_states.clone())
                 if compute_loss:
-                    ploss += (
-                        self.predcost(pred_step, state[:, :, i + 1 : i + 2]) / nsteps
-                    )
+                    target = state[:, :, i + 1 : i + 2]
+                    if stop_grad_target:
+                        target = target.detach()
+                    ploss += self.predcost(pred_step, target) / nsteps
         else:
             raise ValueError(f"Unknown unroll_mode: {unroll_mode}")
 
