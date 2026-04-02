@@ -25,7 +25,7 @@ optim:
 loss:
   std_coeff: 10
   cov_coeff: 50
-  pred_coeff: 10.0  # cosine loss ~0.01-0.02; needs 10x to balance vicreg ~0.5
+  pred_coeff: 2
   vicreg_lambda: 1.0
 
 logging:

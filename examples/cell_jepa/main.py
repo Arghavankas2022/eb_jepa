@@ -74,21 +74,6 @@ def main(fname="examples/cell_jepa/cfgs/default.yaml", **overrides):
     else:
         logger.warning("No Excel path found; valid_transitions will be empty.")
 
-    # Save valid_transitions as a readable CSV (one row per source → target edge)
-    if valid_transitions and full_dataset.cell_type_to_idx:
-        import pandas as pd
-        idx_to_name = {v: k for k, v in full_dataset.cell_type_to_idx.items()}
-        rows = [
-            {"source_cell_type": idx_to_name.get(src, str(src)),
-             "target_cell_type": idx_to_name.get(tgt, str(tgt))}
-            for src, targets in sorted(valid_transitions.items())
-            for tgt in sorted(targets)
-        ]
-        vt_csv_path = os.path.join(cfg.meta.output_dir, "valid_transitions.csv")
-        os.makedirs(cfg.meta.output_dir, exist_ok=True)
-        pd.DataFrame(rows).to_csv(vt_csv_path, index=False)
-        logger.info(f"Saved valid transitions to {vt_csv_path}")
-    
     # Reproducible 80/20 Split
     train_size = int(0.8 * len(full_dataset))
     test_size = len(full_dataset) - train_size
