@@ -63,7 +63,7 @@ def run_asymmetry_test(ckpt_path, forward_h5ad, forward_pairs, backward_h5ad, ba
         cov_coeff=cfg.loss.cov_coeff, 
         proj=projector
     )
-    ploss_fn = SquareLossSeq(proj=projector)
+    ploss_fn = SquareLossSeq(proj=None)  # prediction loss in raw 256D latent space
     
     jepa = JEPA(encoder, torch.nn.Identity(), predictor, regularizer, ploss_fn).to(device)
     jepa.load_state_dict(ckpt['model_state_dict'])
